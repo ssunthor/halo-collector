@@ -9,25 +9,6 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p /opt/data-collector
 
-# --- Helper Function: Validate IP in CIDR ---
-check_in_range() {
-    local ip=$1
-    local cidr=$2
-    local net=$(echo $cidr | cut -d/ -f1)
-    local mask=$(echo $cidr | cut -d/ -f2)
-    res=$(awk -v ip="$ip" -v net="$net" -v mask="$mask" '
-        function ip2int(ip) {
-            split(ip, a, ".");
-            return (a[1] * 16777216) + (a[2] * 65536) + (a[3] * 256) + a[4];
-        }
-        BEGIN {
-            m = 4294967295 - (2^(32 - mask) - 1);
-            if (and(ip2int(ip), m) == and(ip2int(net), m)) print "1";
-            else print "0";
-        }' 2>/dev/null)
-    [[ "$res" == "1" ]]
-}
-
 # ==========================================
 # PHASE 0: Pre-flight naming check
 # ==========================================
@@ -41,17 +22,17 @@ if ! ip link show eth0 > /dev/null 2>&1; then
     fi
     update-grub
     
-    whiptail --title "System Initialization" --msgbox "The appliance needs to adjust network interface naming (eth0/eth1).\n\nThe system will reboot now and resume setup automatically." 10 60
+    whiptail --title "System Initialization" --msgbox "The appliance needs to adjust network interface naming (eth0).\n\nThe system will reboot now and resume setup automatically." 10 60
     reboot
     exit 0
 fi
 
 # ==========================================
-# PHASE 1: Identity, Network, & Connectivity
+# PHASE 1: Identity, Security, & Network Configuration
 # ==========================================
 if [ ! -f /opt/data-collector/.phase1_done ]; then
 
-    whiptail --title "Defense Halo Collector v0.5" --msgbox "Welcome to the Setup Wizard.\n\nPress OK to begin Identity and Network configuration." 10 60
+    whiptail --title "Defense Halo Collector v0.6" --msgbox "Welcome to the Setup Wizard.\n\nPress OK to begin Identity and Security configuration." 10 60
 
     # --- 1. Identity ---
     HN=$(whiptail --title "System Identity" --inputbox "Enter Hostname:" 10 60 "halo-collector" 3>&1 1>&2 2>&3)
@@ -76,28 +57,6 @@ if [ ! -f /opt/data-collector/.phase1_done ]; then
         fi
     done
 
-    # --- 3. Interface eth0 (Management) ---
-    ETH0_IP=$(whiptail --title "eth0 (Management)" --inputbox "Enter eth0 IP/CIDR (e.g., 192.168.1.10/24):" 10 60 3>&1 1>&2 2>&3)
-    ETH0_GW=$(whiptail --title "eth0 (Management)" --inputbox "Enter eth0 Default Gateway:" 10 60 3>&1 1>&2 2>&3)
-
-    until check_in_range "$ETH0_GW" "$ETH0_IP"; do
-        whiptail --title "Error" --msgbox "Gateway $ETH0_GW is outside of the $ETH0_IP range." 10 60
-        ETH0_GW=$(whiptail --title "eth0 (Management)" --inputbox "Re-enter eth0 Default Gateway:" 10 60 3>&1 1>&2 2>&3)
-    done
-
-    # --- 4. Interface eth1 (Data) ---
-    ETH1_IP=$(whiptail --title "eth1 (Data/Backend)" --inputbox "Enter eth1 IP/CIDR (e.g., 10.10.50.10/24):" 10 60 3>&1 1>&2 2>&3)
-    ETH1_GW=$(whiptail --title "eth1 (Data/Backend)" --inputbox "Enter eth1 Backend Gateway:" 10 60 3>&1 1>&2 2>&3)
-
-    until check_in_range "$ETH1_GW" "$ETH1_IP"; do
-        whiptail --title "Error" --msgbox "Backend Gateway $ETH1_GW is outside of the $ETH1_IP range." 10 60
-        ETH1_GW=$(whiptail --title "eth1 (Data/Backend)" --inputbox "Re-enter eth1 Backend Gateway:" 10 60 3>&1 1>&2 2>&3)
-    done
-
-    # --- 5. DNS & Kafka ---
-    DNS1=$(whiptail --title "DNS" --inputbox "Enter Primary DNS:" 10 60 "8.8.8.8" 3>&1 1>&2 2>&3)
-    DNS2=$(whiptail --title "DNS" --inputbox "Enter Secondary DNS:" 10 60 "8.8.4.4" 3>&1 1>&2 2>&3)
-
     # --- Apply Identity ---
     hostnamectl set-hostname "$HN"
     echo "127.0.1.1 $HN" >> /etc/hosts
@@ -105,8 +64,8 @@ if [ ! -f /opt/data-collector/.phase1_done ]; then
         sed -i 's/preserve_hostname: false/preserve_hostname: true/' /etc/cloud/cloud.cfg
     fi
 
-    # --- Apply Netplan ---
-    whiptail --title "Applying Network" --infobox "Applying Netplan configuration to eth0 and eth1..." 8 60
+    # --- Apply Netplan Configuration ---
+    whiptail --title "Applying Network" --infobox "Applying static network configuration to eth0..." 8 60
     rm /etc/netplan/* -f
     tee /etc/netplan/01-netcfg.yaml > /dev/null <<EOF
 network:
@@ -114,24 +73,13 @@ network:
   renderer: networkd
   ethernets:
     eth0:
-      addresses: [$ETH0_IP]
+      addresses: [100.64.1.11/24]
       routes:
         - to: default
-          via: $ETH0_GW
+          via: 100.64.1.254
       nameservers:
         search: [$SDOMAIN]
-        addresses: [$DNS1, $DNS2]
-    eth1:
-      addresses: [$ETH1_IP]
-      routes:
-        - to: 10.250.104.0/24
-          via: $ETH1_GW
-        - to: 10.250.120.0/24
-          via: $ETH1_GW
-        - to: 10.250.136.0/24
-          via: $ETH1_GW
-        - to: 10.250.152.0/24
-          via: $ETH1_GW
+        addresses: [8.8.8.8, 1.1.1.1]
 EOF
     chmod 600 /etc/netplan/01-netcfg.yaml
     netplan apply
@@ -152,7 +100,7 @@ EOF
     whiptail --title "Updates" --infobox "Running system upgrades..." 8 60
     apt update -y && apt upgrade -y
 
-        # --- Update /etc/issue (Dynamic Banner) ---
+    # --- Update /etc/issue (Dynamic Banner) ---
     tee /etc/issue > /dev/null <<EOF
          ################# ##################### #####################     
       ################### ##################### #####################      
@@ -171,25 +119,24 @@ EOF
 
 
 ----------------------------------------------------------------------
-                     DEFENSE HALO COLLECTOR v0.5
+                     DEFENSE HALO COLLECTOR v0.6
 ----------------------------------------------------------------------
-  Manage via SSH or log in locally to configure networking.
+  Manage via SSH or log in locally.
   Default login: haloadmin
 EOF
 
-        # --- Update /etc/update-motd.d/10-help-text (Dynamic Banner) ---
+    # --- Update /etc/update-motd.d/10-help-text (Dynamic Banner) ---
     tee /etc/update-motd.d/10-help-text > /dev/null <<EOF
 #!/bin/sh
 
 printf "************************************************************\n"
-printf "*                                                          *\n"
-printf "* DEFENSE HALO COLLECTOR v0.5                              *\n"
+printf "* *\n"
+printf "* DEFENSE HALO COLLECTOR v0.6                              *\n"
 printf "* Data Collector                                           *\n"
-printf "*                                                          *\n"
+printf "* *\n"
 printf "************************************************************\n"
 printf "\n"
-printf "Config: /opt/data-collector/"
-printf "\n"
+printf "Config: /opt/data-collector/\n"
 printf "\n"
 EOF
 
@@ -201,10 +148,6 @@ EOF
         resize2fs $(findmnt -n -o SOURCE /) || true
     fi
 
-
-
-   
-
     touch /opt/data-collector/.phase1_done
 
     if [ -f /var/run/reboot-required ]; then
@@ -215,13 +158,11 @@ EOF
 fi
 
 # ==========================================
-# PHASE 2: Docker Installation
+# PHASE 2: Docker Installation & Service Startup
 # ==========================================
-
-
 if [ -f /opt/data-collector/.phase1_done ] && [ ! -f /opt/data-collector/.setup_done ]; then
   
-    K_BROKERS=$(whiptail --title "Kafka" --inputbox "Enter Kafka Brokers (IP:Port):" 10 60 3>&1 1>&2 2>&3)
+    K_BROKERS=$(whiptail --title "Kafka" --inputbox "Enter Kafka bootstrap (IP:Port):" 10 60 3>&1 1>&2 2>&3)
 
     # Create env for Docker
     tee /opt/data-collector/.env > /dev/null <<EOF
@@ -239,7 +180,7 @@ services:
     environment:
       - KAFKA_BROKERS=${K_BROKERS}
     volumes:
-      - ./fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf
+      - ./fluent-bit-rfc-5424.conf:/fluent-bit/etc/fluent-bit.conf
       - ./parser-rfc-5454.conf:/fluent-bit/etc/parser.conf
     restart: always
 
@@ -251,7 +192,7 @@ services:
     environment:
       - KAFKA_BROKERS=${K_BROKERS}
     volumes:
-      - ./fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf
+      - ./fluent-bit-rfc-5424.conf:/fluent-bit/etc/fluent-bit.conf
       - ./parser-rfc-3164.conf:/fluent-bit/etc/parser.conf
     restart: always
 
@@ -269,8 +210,8 @@ services:
       -transport.kafka.topic=netflow-input
 EOF
 
-    # Create fluent-bit configuration
-    tee /opt/data-collector/fluent-bit.conf > /dev/null <<EOF
+    # Create fluent-bit rfc 5424 configuration
+    tee /opt/data-collector/fluent-bit-rfc-5424.conf > /dev/null <<EOF
 [SERVICE]
    Flush        1
    Log_Level    info
@@ -281,6 +222,31 @@ EOF
    Mode         udp
    Listen       0.0.0.0
    Port         514
+   Parser       custom-syslog
+   Tag          syslog.raw
+
+[OUTPUT]
+   Name                kafka
+   Match               *
+   Brokers             ${K_BROKERS}
+   Topics              syslog-input
+   message_key_field   host
+   rdkafka.linger.ms   500
+   rdkafka.compression.type lz4
+EOF
+
+    # Create fluent-bit rfc 3164 configuration
+    tee /opt/data-collector/fluent-bit-rfc-3164.conf > /dev/null <<EOF
+[SERVICE]
+   Flush        1
+   Log_Level    info
+   Parsers_File /fluent-bit/etc/parser.conf
+
+[INPUT]
+   Name         syslog
+   Mode         udp
+   Listen       0.0.0.0
+   Port         515
    Parser       custom-syslog
    Tag          syslog.raw
 
