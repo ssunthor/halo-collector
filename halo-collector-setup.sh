@@ -30,7 +30,7 @@ fi
 # ==========================================
 if [ ! -f /opt/data-collector/.phase1_done ]; then
 
-    whiptail --title "Defense Halo Collector v0.7" --msgbox "Welcome to the Setup Wizard.\n\nPress OK to begin Identity and Security configuration." 10 60
+    whiptail --title "Defense Halo Collector v0.8" --msgbox "Welcome to the Setup Wizard.\n\nPress OK to begin Identity and Security configuration." 10 60
 
     # --- 1. Identity ---
     HN=$(whiptail --title "System Identity" --inputbox "Enter Hostname:" 10 60 "halo-collector" 3>&1 1>&2 2>&3)
@@ -116,7 +116,7 @@ EOF
 
 
 ----------------------------------------------------------------------
-                     DEFENSE HALO COLLECTOR v0.7
+                     DEFENSE HALO COLLECTOR v0.8
 ----------------------------------------------------------------------
   Manage via SSH or log in locally.
   Default login: haloadmin
@@ -128,7 +128,7 @@ EOF
 
 printf "************************************************************\n"
 printf "*                                                          *\n"
-printf "* DEFENSE HALO COLLECTOR v0.7                              *\n"
+printf "* DEFENSE HALO COLLECTOR v0.8                              *\n"
 printf "* Data Collector                                           *\n"
 printf "*                                                          *\n"
 printf "************************************************************\n"
@@ -243,44 +243,26 @@ EOF
 EOF
 
     # Create fluent-bit rfc 5424 configuration
-    tee /opt/data-collector/fluent-bit-rfc-5424.conf > /dev/null <<EOF
+    tee /opt/data-collector/fluent-bit.conf > /dev/null <<EOF
 [SERVICE]
-   Flush        1
-   Log_Level    info
-   Parsers_File /fluent-bit/etc/parser.conf
+    Flush        1
+    Log_Level    info
+    Parsers_File /fluent-bit/etc/parser.conf
 
 [INPUT]
-   Name         syslog
-   Mode         udp
-   Listen       0.0.0.0
-   Port         514
-   Parser       custom-syslog
-   Tag          syslog.raw
+    Name         udp
+    Listen       0.0.0.0
+    Port         514
+    Format       none
+    Tag          syslog.raw
 
-[OUTPUT]
-   Name                kafka
-   Match               *
-   Brokers             ${K_BROKERS}
-   Topics              syslog-input
-   message_key_field   host
-   rdkafka.linger.ms   500
-   rdkafka.compression.type lz4
-EOF
-
-    # Create fluent-bit rfc 3164 configuration
-    tee /opt/data-collector/fluent-bit-rfc-3164.conf > /dev/null <<EOF
-[SERVICE]
-   Flush        1
-   Log_Level    info
-   Parsers_File /fluent-bit/etc/parser.conf
-
-[INPUT]
-   Name         syslog
-   Mode         udp
-   Listen       0.0.0.0
-   Port         515
-   Parser       custom-syslog
-   Tag          syslog.raw
+[FILTER]
+    Name         parser
+    Match        syslog.raw
+    Key_Name     log
+    Parser       syslog-5424
+    Parser       syslog-3164
+    Reserve_Data On
 
 [OUTPUT]
    Name                kafka
@@ -293,46 +275,39 @@ EOF
 EOF
 
     # Create fluent-bit parser rfc 5454
-    tee /opt/data-collector/parser-rfc-5454.conf > /dev/null <<EOF
+    tee /opt/data-collector/parser.conf > /dev/null <<EOF
+# RFC 5424
 [PARSER]
-   Name        custom-syslog
-   Format      regex
-   Regex       ^(?<message>(?:<\d+>)?(?:[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+(?<host>\S+).*)$
-EOF
+    Name        syslog-5424
+    Format      regex
+    Regex       ^\<(?<pri>\d+)\>(?:(?<version>\d+)\s+)?(?<time>\d{4}-\d{2}-\d{2}T[^\s]+)\s+(?<host>[^\s]+)\s+(?<appname>[^\s]+)\s+(?<pid>[^\s]+)\s+(?<msgid>[^\s]+)(?:\s+(?<sd>\[.*?\]|-))?\s*(?<message>.*)$
+    Time_Key    time
+    Time_Format %Y-%m-%dT%H:%M:%S%z
+    Time_Keep   On
 
-    # Create fluent-bit parser rfc 3164
-    tee /opt/data-collector/parser-rfc-3164.conf > /dev/null <<EOF
+# RFC 3164
 [PARSER]
-   Name        custom-syslog
-   Format      regex
-   Regex       /^\<(?<pri>[0-9]+)\>(?<time>[^ ]* {1,2}[^ ]* [^ ]*) (?<host>[^ ]*) (?<ident>[a-zA-Z0-9_\/\.\-]*)(?:\[(?<pid>[0-9]+)\])?(?:[^\:]*\:)? *(?<message>.*)$/
+    Name        syslog-3164
+    Format      regex
+    Regex       ^\<(?<pri>\d+)\>(?<time>[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+(?<host>\S+)\s+(?<appname>[^\[\:\s]+)?(?:\[(?<pid>\d+)\])?\:\s*(?<message>.*)$
+    Time_Key    time
+    Time_Format %b %d %H:%M:%S
+    Time_Keep   On
 EOF
 
     # Create Docker Compose file
     tee /opt/data-collector/halo-collectors.yaml > /dev/null <<EOF
 services:
-  fluent-bit-rfc-5424:
+  fluent-bit-syslog:
     image: fluent/fluent-bit:latest
-    container_name: fluent-bit-5424
+    container_name: fluent-bit-syslog
     ports:
       - "514:514/udp"
     environment:
       - KAFKA_BROKERS=${K_BROKERS}
     volumes:
-      - ./fluent-bit-rfc-5424.conf:/fluent-bit/etc/fluent-bit.conf
-      - ./parser-rfc-5454.conf:/fluent-bit/etc/parser.conf
-    restart: always
-
-  fluent-bit-rfc-3164:
-    image: fluent/fluent-bit:latest
-    container_name: fluent-bit-3164
-    ports:
-      - "515:514/udp"
-    environment:
-      - KAFKA_BROKERS=${K_BROKERS}
-    volumes:
-      - ./fluent-bit-rfc-3164.conf:/fluent-bit/etc/fluent-bit.conf
-      - ./parser-rfc-3164.conf:/fluent-bit/etc/parser.conf
+      - ./fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf
+      - ./parser.conf:/fluent-bit/etc/parser.conf
     restart: always
 
   fluent-bit-json:
