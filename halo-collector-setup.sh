@@ -7,16 +7,14 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 export DEBIAN_FRONTEND=noninteractive
-mkdir -p /opt/data-collector
+mkdir -p /opt/data-collector/certs
 
 # ==========================================
 # PHASE 0: Pre-flight naming check
 # ==========================================
-# If eth0 doesn't exist, we must fix GRUB and reboot before anything else.
 if ! ip link show eth0 > /dev/null 2>&1; then
     echo "Preparing system interface naming conventions..."
     sed -i 's/GRUB_CMDLINE_LINUX=""/GRUB_CMDLINE_LINUX="net.ifnames=0 biosdevname=0"/' /etc/default/grub
-    # Also handle cases where there might already be parameters
     if ! grep -q "net.ifnames=0" /etc/default/grub; then
         sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 net.ifnames=0 biosdevname=0"/' /etc/default/grub
     fi
@@ -32,13 +30,13 @@ fi
 # ==========================================
 if [ ! -f /opt/data-collector/.phase1_done ]; then
 
-    whiptail --title "Defense Halo Collector v0.6" --msgbox "Welcome to the Setup Wizard.\n\nPress OK to begin Identity and Security configuration." 10 60
+    whiptail --title "Defense Halo Collector v0.7" --msgbox "Welcome to the Setup Wizard.\n\nPress OK to begin Identity and Security configuration." 10 60
 
     # --- 1. Identity ---
     HN=$(whiptail --title "System Identity" --inputbox "Enter Hostname:" 10 60 "halo-collector" 3>&1 1>&2 2>&3)
     SDOMAIN=$(whiptail --title "System Identity" --inputbox "Enter DNS Search Domain:" 10 60 "internal.corp" 3>&1 1>&2 2>&3)
 
-    # --- 2. Security (Password Change) ---
+    # --- 2. Security (Password Change for haloadmin) ---
     while true; do
         ADMIN_PASS=$(whiptail --title "Security Setup" --passwordbox "Set a new password for the 'haloadmin' account:" 10 60 3>&1 1>&2 2>&3)
         if [ -z "$ADMIN_PASS" ]; then
@@ -49,7 +47,6 @@ if [ ! -f /opt/data-collector/.phase1_done ]; then
         ADMIN_PASS_CONFIRM=$(whiptail --title "Security Setup" --passwordbox "Confirm the new password:" 10 60 3>&1 1>&2 2>&3)
         
         if [ "$ADMIN_PASS" = "$ADMIN_PASS_CONFIRM" ]; then
-            # Apply the password change to the system
             echo "haloadmin:$ADMIN_PASS" | chpasswd
             break
         else
@@ -119,7 +116,7 @@ EOF
 
 
 ----------------------------------------------------------------------
-                     DEFENSE HALO COLLECTOR v0.6
+                     DEFENSE HALO COLLECTOR v0.7
 ----------------------------------------------------------------------
   Manage via SSH or log in locally.
   Default login: haloadmin
@@ -130,13 +127,14 @@ EOF
 #!/bin/sh
 
 printf "************************************************************\n"
-printf "* *\n"
-printf "* DEFENSE HALO COLLECTOR v0.6                              *\n"
+printf "*                                                          *\n"
+printf "* DEFENSE HALO COLLECTOR v0.7                              *\n"
 printf "* Data Collector                                           *\n"
-printf "* *\n"
+printf "*                                                          *\n"
 printf "************************************************************\n"
 printf "\n"
 printf "Config: /opt/data-collector/\n"
+printf "Certs:  /opt/data-collector/certs/\n"
 printf "\n"
 EOF
 
@@ -158,56 +156,90 @@ EOF
 fi
 
 # ==========================================
-# PHASE 2: Docker Installation & Service Startup
+# PHASE 2: Docker & Collector Service Setup
 # ==========================================
 if [ -f /opt/data-collector/.phase1_done ] && [ ! -f /opt/data-collector/.setup_done ]; then
   
     K_BROKERS=$(whiptail --title "Kafka" --inputbox "Enter Kafka bootstrap (IP:Port):" 10 60 3>&1 1>&2 2>&3)
 
-    # Create env for Docker
+    # --- JSON API Password Prompt ---
+    while true; do
+        JSON_PASS=$(whiptail --title "JSON API Authentication" --passwordbox "Set password for HTTPS JSON API ('haloapi' user):" 10 60 3>&1 1>&2 2>&3)
+        if [ -z "$JSON_PASS" ]; then
+            whiptail --title "Error" --msgbox "Password cannot be empty. Please try again." 10 60
+            continue
+        fi
+
+        JSON_PASS_CONFIRM=$(whiptail --title "JSON API Authentication" --passwordbox "Confirm HTTPS JSON API password:" 10 60 3>&1 1>&2 2>&3)
+        
+        if [ "$JSON_PASS" = "$JSON_PASS_CONFIRM" ]; then
+            break
+        else
+            whiptail --title "Error" --msgbox "Passwords do not match. Please try again." 10 60
+        fi
+    done
+
+    # --- Install Prerequisites ---
+    whiptail --title "Dependencies" --infobox "Installing apache2-utils and openssl..." 8 60
+    apt-get update -y && apt-get install -y apache2-utils openssl ca-certificates curl gnupg lsb-release
+
+    # --- Generate htpasswd File ---
+    htpasswd -cb /opt/data-collector/nginx.htpasswd haloapi "$JSON_PASS"
+    chmod 644 /opt/data-collector/nginx.htpasswd
+
+    # --- Generate Self-Signed Certificates (If missing) ---
+    if [ ! -f /opt/data-collector/certs/server.crt ] || [ ! -f /opt/data-collector/certs/server.key ]; then
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+          -keyout /opt/data-collector/certs/server.key \
+          -out /opt/data-collector/certs/server.crt \
+          -subj "/CN=halo-collector" >/dev/null 2>&1
+    fi
+
+    # Create .env for Docker
     tee /opt/data-collector/.env > /dev/null <<EOF
 KAFKA_BROKERS=$K_BROKERS
 EOF
 
-    # Create Halo Collector Compose file
-    tee /opt/data-collector/halo-collectors.yaml > /dev/null <<EOF
-services:
-  fluent-bit-rfc-5424:
-    image: fluent/fluent-bit:latest
-    container_name: fluent-bit-5424
-    ports:
-      - "514:514/udp"
-    environment:
-      - KAFKA_BROKERS=${K_BROKERS}
-    volumes:
-      - ./fluent-bit-rfc-5424.conf:/fluent-bit/etc/fluent-bit.conf
-      - ./parser-rfc-5454.conf:/fluent-bit/etc/parser.conf
-    restart: always
+    # Create Nginx Proxy Configuration
+    tee /opt/data-collector/nginx.conf > /dev/null <<EOF
+server {
+    listen 443 ssl;
+    server_name _;
 
-  fluent-bit-rfc-3164:
-    image: fluent/fluent-bit:latest
-    container_name: fluent-bit-3164
-    ports:
-      - "515:514/udp"
-    environment:
-      - KAFKA_BROKERS=${K_BROKERS}
-    volumes:
-      - ./fluent-bit-rfc-5424.conf:/fluent-bit/etc/fluent-bit.conf
-      - ./parser-rfc-3164.conf:/fluent-bit/etc/parser.conf
-    restart: always
+    ssl_certificate     /etc/nginx/certs/server.crt;
+    ssl_certificate_key /etc/nginx/certs/server.key;
 
-  goflow2:
-    image: netsampler/goflow2:latest
-    container_name: goflow2
-    restart: always
-    ports:
-      - "2055:2055/udp"
-    command: >
-      -listen=netflow://:2055
-      -format=json
-      -transport=kafka
-      -transport.kafka.brokers=${K_BROKERS}
-      -transport.kafka.topic=netflow-input
+    auth_basic           "Defense Halo JSON API";
+    auth_basic_user_file /etc/nginx/.htpasswd;
+
+    location / {
+        proxy_pass http://fluent-bit-json:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+
+    # Create fluent-bit JSON configuration
+    tee /opt/data-collector/fluent-bit-json.conf > /dev/null <<EOF
+[SERVICE]
+   Flush        1
+   Log_Level    info
+
+[INPUT]
+   Name         http
+   Host         0.0.0.0
+   Port         8080
+
+[OUTPUT]
+   Name                kafka
+   Match               *
+   Brokers             ${K_BROKERS}
+   Topics              json-input
+   rdkafka.linger.ms   500
+   rdkafka.compression.type lz4
 EOF
 
     # Create fluent-bit rfc 5424 configuration
@@ -276,8 +308,70 @@ EOF
    Regex       /^\<(?<pri>[0-9]+)\>(?<time>[^ ]* {1,2}[^ ]* [^ ]*) (?<host>[^ ]*) (?<ident>[a-zA-Z0-9_\/\.\-]*)(?:\[(?<pid>[0-9]+)\])?(?:[^\:]*\:)? *(?<message>.*)$/
 EOF
 
-    whiptail --title "Docker" --infobox "Installing latest Docker Engine..." 8 60
-    apt-get install -y ca-certificates curl gnupg lsb-release
+    # Create Docker Compose file
+    tee /opt/data-collector/halo-collectors.yaml > /dev/null <<EOF
+services:
+  fluent-bit-rfc-5424:
+    image: fluent/fluent-bit:latest
+    container_name: fluent-bit-5424
+    ports:
+      - "514:514/udp"
+    environment:
+      - KAFKA_BROKERS=${K_BROKERS}
+    volumes:
+      - ./fluent-bit-rfc-5424.conf:/fluent-bit/etc/fluent-bit.conf
+      - ./parser-rfc-5454.conf:/fluent-bit/etc/parser.conf
+    restart: always
+
+  fluent-bit-rfc-3164:
+    image: fluent/fluent-bit:latest
+    container_name: fluent-bit-3164
+    ports:
+      - "515:514/udp"
+    environment:
+      - KAFKA_BROKERS=${K_BROKERS}
+    volumes:
+      - ./fluent-bit-rfc-3164.conf:/fluent-bit/etc/fluent-bit.conf
+      - ./parser-rfc-3164.conf:/fluent-bit/etc/parser.conf
+    restart: always
+
+  fluent-bit-json:
+    image: fluent/fluent-bit:latest
+    container_name: fluent-bit-json
+    environment:
+      - KAFKA_BROKERS=${K_BROKERS}
+    volumes:
+      - ./fluent-bit-json.conf:/fluent-bit/etc/fluent-bit.conf
+    restart: always
+
+  nginx-proxy:
+    image: nginx:alpine
+    container_name: nginx-proxy
+    ports:
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+      - ./nginx.htpasswd:/etc/nginx/.htpasswd:ro
+    depends_on:
+      - fluent-bit-json
+    restart: always
+
+  goflow2:
+    image: netsampler/goflow2:latest
+    container_name: goflow2
+    restart: always
+    ports:
+      - "2055:2055/udp"
+    command: >
+      -listen=netflow://:2055
+      -format=json
+      -transport=kafka
+      -transport.kafka.brokers=${K_BROKERS}
+      -transport.kafka.topic=netflow-input
+EOF
+
+    whiptail --title "Docker" --infobox "Installing Docker Engine..." 8 60
     mkdir -m 0755 -p /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg --yes
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
